@@ -33,6 +33,11 @@ class AnishtayinRayVpnService : VpnService() {
     private var socksServer: ServerSocket? = null
     private var tunThread: Thread? = null
 
+    // Safe socket tracker and stream references to avoid system-wide leaks
+    private var tunInputChannel: java.io.FileInputStream? = null
+    private var tunOutputChannel: java.io.FileOutputStream? = null
+    private val activeSockets = java.util.Collections.synchronizedList(mutableListOf<Socket>())
+
     override fun onCreate() {
         super.onCreate()
         isServiceRunning.value = true
@@ -173,6 +178,7 @@ class AnishtayinRayVpnService : VpnService() {
     }
 
     private fun handleClient(clientSocket: Socket) {
+        activeSockets.add(clientSocket)
         try {
             val inputStream = clientSocket.getInputStream()
             val outputStream = clientSocket.getOutputStream()
@@ -323,6 +329,9 @@ class AnishtayinRayVpnService : VpnService() {
                 connectDirect(clientSocket, clientInStream, outputStream, targetHost, targetPort)
             }
         } catch (e: Exception) {
+            Log.e("AnishtayinVpnService", "Error in HTTP proxy client tunnel handler", e)
+        } finally {
+            activeSockets.remove(clientSocket)
             try { clientSocket.close() } catch (ex: Exception) {}
         }
     }
@@ -634,6 +643,20 @@ class AnishtayinRayVpnService : VpnService() {
     private fun disconnect() {
         isRunning = false
         isServiceRunning.value = false
+        
+        // 1. Rigorous cleanup of active network sockets
+        synchronized(activeSockets) {
+            for (socket in activeSockets) {
+                try {
+                    socket.close()
+                } catch (e: Exception) {
+                    Log.e("AnishtayinVpnService", "Error closing sockets on exit", e)
+                }
+            }
+            activeSockets.clear()
+        }
+
+        // 2. Shut down proxy servers immediately to trigger IOException in accept() loops
         try {
             proxyServer?.close()
             proxyServer = null
@@ -646,21 +669,46 @@ class AnishtayinRayVpnService : VpnService() {
         } catch (e: Exception) {
             Log.e("AnishtayinVpnService", "Error closing SOCKS server", e)
         }
+
+        // 3. Close the TUN streams to unblock native read/write threads
+        try {
+            tunInputChannel?.close()
+            tunInputChannel = null
+        } catch (e: Exception) {
+            Log.e("AnishtayinVpnService", "Error closing input stream", e)
+        }
+        try {
+            tunOutputChannel?.close()
+            tunOutputChannel = null
+        } catch (e: Exception) {
+            Log.e("AnishtayinVpnService", "Error closing output stream", e)
+        }
+
+        // 4. Close the interface descriptor
         try {
             vpnInterface?.close()
             vpnInterface = null
         } catch (e: Exception) {
             Log.e("AnishtayinVpnService", "Error closing interface", e)
         }
+
+        // 5. Interrupt worker thread
         try {
             tunThread?.interrupt()
             tunThread = null
         } catch (e: Exception) {}
-        stopForeground(true)
+
+        // 6. Stop foreground state
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            stopForeground(true)
+        }
         stopSelf()
     }
 
     private fun handleSocksClient(clientSocket: Socket) {
+        activeSockets.add(clientSocket)
         try {
             val inStream = clientSocket.getInputStream()
             val outStream = clientSocket.getOutputStream()
@@ -772,6 +820,9 @@ class AnishtayinRayVpnService : VpnService() {
                 connectDirect(clientSocket, inStream, outStream, targetHost, targetPort)
             }
         } catch (e: Exception) {
+            Log.e("AnishtayinVpnService", "Error in SOCKS proxy client tunnel handler", e)
+        } finally {
+            activeSockets.remove(clientSocket)
             try { clientSocket.close() } catch (ex: Exception) {}
         }
     }
@@ -780,6 +831,9 @@ class AnishtayinRayVpnService : VpnService() {
         val fd = vpnInterface?.fileDescriptor ?: return
         val inputChannel = java.io.FileInputStream(fd)
         val outputChannel = java.io.FileOutputStream(fd)
+        
+        tunInputChannel = inputChannel
+        tunOutputChannel = outputChannel
         
         tunThread = Thread {
             val buffer = ByteArray(16384)

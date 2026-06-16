@@ -102,13 +102,13 @@ fun HomeScreen(
     val activeProfile = profiles.firstOrNull { it.isSelected }
 
     val fabPaddingBottom by animateDpAsState(
-        targetValue = if (isConnected) 295.dp else 205.dp,
+        targetValue = if (isConnected) 365.dp else 205.dp,
         animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
         label = "fab_padding"
     )
 
     val listPaddingBottom by animateDpAsState(
-        targetValue = if (isConnected) 305.dp else 215.dp,
+        targetValue = if (isConnected) 375.dp else 215.dp,
         animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
         label = "list_padding"
     )

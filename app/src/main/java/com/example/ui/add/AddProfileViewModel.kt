@@ -14,31 +14,13 @@ class AddProfileViewModel(application: Application) : AndroidViewModel(applicati
         return dao.getProfileById(id)
     }
 
-    fun saveProfile(id: Int, name: String, protocol: String, address: String, port: Int, uuid: String) {
+    fun saveProfile(profile: VpnProfile) {
         viewModelScope.launch {
-            if (id != 0) {
-                val existing = dao.getProfileById(id)
-                if (existing != null) {
-                    val updated = existing.copy(
-                        name = name.ifEmpty { "Profile" },
-                        protocol = protocol,
-                        address = address,
-                        port = port,
-                        uuidOrPassword = uuid
-                    )
-                    dao.updateProfile(updated)
-                    return@launch
-                }
+            if (profile.id != 0) {
+                dao.updateProfile(profile)
+            } else {
+                dao.insertProfile(profile)
             }
-            // Otherwise insert new
-            val profile = VpnProfile(
-                name = name.ifEmpty { "New Profile" },
-                protocol = protocol,
-                address = address,
-                port = port,
-                uuidOrPassword = uuid
-            )
-            dao.insertProfile(profile)
         }
     }
 }
