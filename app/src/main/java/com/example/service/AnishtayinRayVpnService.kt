@@ -37,11 +37,73 @@ class AnishtayinRayVpnService : VpnService() {
     private var tunInputChannel: java.io.FileInputStream? = null
     private var tunOutputChannel: java.io.FileOutputStream? = null
     private val activeSockets = java.util.Collections.synchronizedList(mutableListOf<Socket>())
+    private var dohClient: okhttp3.OkHttpClient? = null
+    private var directDohClient: okhttp3.OkHttpClient? = null
+
+    // High performance pre-allocated thread pool executor (like native Go-coroutines in v2ray)
+    private val proxyExecutor = java.util.concurrent.ThreadPoolExecutor(
+        16, 256, 30L, java.util.concurrent.TimeUnit.SECONDS,
+        java.util.concurrent.SynchronousQueue<Runnable>(),
+        java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy()
+    )
+
+    // High performance memory cache for the active profile and its pre-resolved IP
+    @Volatile
+    private var cachedActiveProfile: com.example.data.VpnProfile? = null
+    @Volatile
+    private var cachedServerAddr: String? = null
+
+    // Concurrent high-speed DNS Cache with TTL tracking to bypass remote roundtrips
+    private val dnsCache = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
+    private val dnsCacheExpiry = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun byteArrayToHex(bytes: ByteArray, start: Int, length: Int): String {
+        val hexChars = "0123456789ABCDEF"
+        val result = java.lang.StringBuilder(length * 2)
+        for (i in start until (start + length)) {
+            val octet = bytes[i].toInt()
+            val firstIndex = (octet and 0xF0) ushr 4
+            val secondIndex = octet and 0x0F
+            result.append(hexChars[firstIndex])
+            result.append(hexChars[secondIndex])
+        }
+        return result.toString()
+    }
+
+    private fun tuneSocket(socket: Socket) {
+        try {
+            socket.tcpNoDelay = true
+            socket.keepAlive = true
+            socket.sendBufferSize = 131072 // 128KB optimal buffer
+            socket.receiveBufferSize = 131072 // 128KB optimal buffer
+            socket.trafficClass = 0x18 // Low delay + high throughput
+        } catch (e: Exception) {
+            Log.e("AnishtayinVpnService", "Error tuning socket", e)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         isServiceRunning.value = true
         createNotificationChannel()
+        
+        // Initialize Doh client with connection pooling and optimal-reuse timeouts
+        val builder = okhttp3.OkHttpClient.Builder()
+            .connectTimeout(2, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(2, java.util.concurrent.TimeUnit.SECONDS)
+            .connectionPool(okhttp3.ConnectionPool(15, 5, java.util.concurrent.TimeUnit.MINUTES))
+        try {
+            val proxy = java.net.Proxy(java.net.Proxy.Type.HTTP, java.net.InetSocketAddress("127.0.0.1", 10809))
+            builder.proxy(proxy)
+        } catch (e: java.lang.Exception) {}
+        dohClient = builder.build()
+
+        // Direct fallback client in case local proxy has not bootstrapped yet
+        directDohClient = okhttp3.OkHttpClient.Builder()
+            .connectTimeout(2, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(2, java.util.concurrent.TimeUnit.SECONDS)
+            .connectionPool(okhttp3.ConnectionPool(10, 5, java.util.concurrent.TimeUnit.MINUTES))
+            .build()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -118,6 +180,7 @@ class AnishtayinRayVpnService : VpnService() {
                 .addAddress("10.8.0.2", 24)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
+                .setMtu(1360)
                 .addRoute("10.8.0.0", 24)
                 .addRoute("1.1.1.1", 32)
                 .addRoute("8.8.8.8", 32)
@@ -148,9 +211,10 @@ class AnishtayinRayVpnService : VpnService() {
                 while (isRunning) {
                     try {
                         val clientSocket = proxyServer?.accept() ?: break
-                        Thread {
+                        tuneSocket(clientSocket)
+                        proxyExecutor.submit {
                             handleClient(clientSocket)
-                        }.start()
+                        }
                     } catch (e: Exception) {
                         // socket closed
                     }
@@ -162,9 +226,10 @@ class AnishtayinRayVpnService : VpnService() {
                 while (isRunning) {
                     try {
                         val clientSocket = socksServer?.accept() ?: break
-                        Thread {
+                        tuneSocket(clientSocket)
+                        proxyExecutor.submit {
                             handleSocksClient(clientSocket)
-                        }.start()
+                        }
                     } catch (e: Exception) {
                         // socket closed
                     }
@@ -367,6 +432,69 @@ class AnishtayinRayVpnService : VpnService() {
         }
     }
 
+    private fun configureAlpn(sslSocket: javax.net.ssl.SSLSocket) {
+        try {
+            val method = sslSocket.javaClass.getMethod("setApplicationProtocols", Array<String>::class.java)
+            method.invoke(sslSocket, arrayOf("h2", "http/1.1"))
+        } catch (e: Exception) {
+            // Fallback gracefully on runtimes that don't support ALPN
+        }
+    }
+
+    private fun bridgeForward(
+        clientSocket: Socket,
+        clientIn: java.io.InputStream,
+        clientOut: java.io.OutputStream,
+        remoteSocket: Socket,
+        remoteIn: java.io.InputStream,
+        remoteOut: java.io.OutputStream
+    ) {
+        val latch = java.util.concurrent.CountDownLatch(1)
+
+        // 1. Client to Remote forwarding using pre-allocated thread pools (asynchronous, non-blocking caller)
+        proxyExecutor.submit {
+            val buffer = ByteArray(65536)
+            try {
+                var bytesRead: Int
+                while (isRunning && !clientSocket.isClosed && !remoteSocket.isClosed) {
+                    bytesRead = clientIn.read(buffer)
+                    if (bytesRead < 0) break
+                    remoteOut.write(buffer, 0, bytesRead)
+                    remoteOut.flush()
+                }
+            } catch (e: Exception) {
+                // Connection broken
+            } finally {
+                try { remoteSocket.close() } catch (e: Exception) {}
+                try { clientSocket.close() } catch (e: Exception) {}
+                latch.countDown()
+            }
+        }
+
+        // 2. Remote to Client forwarding running directly on the current caller thread (extreme CPU / context-switch saving)
+        val buffer = ByteArray(65536)
+        try {
+            var bytesRead: Int
+            while (isRunning && !remoteSocket.isClosed && !clientSocket.isClosed) {
+                bytesRead = remoteIn.read(buffer)
+                if (bytesRead < 0) break
+                clientOut.write(buffer, 0, bytesRead)
+                clientOut.flush()
+            }
+        } catch (e: Exception) {
+            // Connection broken
+        } finally {
+            try { clientSocket.close() } catch (e: Exception) {}
+            try { remoteSocket.close() } catch (e: Exception) {}
+            latch.countDown()
+        }
+
+        // 3. Keep-alive sync bounded to 5 seconds gracefully
+        try {
+            latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (e: Exception) {}
+    }
+
     private fun connectTrojan(
         clientSocket: Socket,
         clientIn: InputStream,
@@ -377,14 +505,26 @@ class AnishtayinRayVpnService : VpnService() {
     ) {
         var trojanSocket: Socket? = null
         try {
-            val serverAddr = InetAddress.getByName(profile.address).hostAddress ?: profile.address
+            val serverAddr = cachedServerAddr ?: try {
+                val resolved = InetAddress.getByName(profile.address).hostAddress
+                if (resolved != null) {
+                    cachedServerAddr = resolved
+                    resolved
+                } else {
+                    profile.address
+                }
+            } catch (e: Exception) {
+                profile.address
+            }
             val rawSocket = Socket()
+            tuneSocket(rawSocket)
             protect(rawSocket)
             rawSocket.connect(InetSocketAddress(serverAddr, profile.port), 6000)
             
             if (profile.security.lowercase() == "tls" || profile.security.lowercase() == "reality" || profile.port == 443) {
                 val factory = getTrustAllSocketFactory()
                 val sslSocket = factory.createSocket(rawSocket, profile.address, profile.port, true) as SSLSocket
+                tuneSocket(sslSocket)
                 if (!profile.sni.isNullOrBlank()) {
                     try {
                         val sslParams = sslSocket.sslParameters
@@ -394,11 +534,13 @@ class AnishtayinRayVpnService : VpnService() {
                         Log.e("AnishtayinProxy", "Unable to apply SNI param to Trojan TLS", ex)
                     }
                 }
+                configureAlpn(sslSocket)
                 sslSocket.startHandshake()
                 trojanSocket = sslSocket
             } else {
                 trojanSocket = rawSocket
             }
+            tuneSocket(trojanSocket)
             
             val trojanOut = trojanSocket.getOutputStream()
             val trojanIn = trojanSocket.getInputStream()
@@ -423,38 +565,7 @@ class AnishtayinRayVpnService : VpnService() {
             trojanOut.write(header.toByteArray())
             trojanOut.flush()
             
-            val clientToTrojan = Thread {
-                val buffer = ByteArray(16384)
-                try {
-                    var bytesRead: Int
-                    while (clientSocket.isConnected && !clientSocket.isClosed) {
-                        bytesRead = clientIn.read(buffer)
-                        if (bytesRead < 0) break
-                        trojanOut.write(buffer, 0, bytesRead)
-                        trojanOut.flush()
-                    }
-                } catch (e: Exception) {}
-                try { trojanSocket.close() } catch (e: Exception) {}
-            }
-            clientToTrojan.start()
-            
-            val trojanToClient = Thread {
-                val buffer = ByteArray(16384)
-                try {
-                    var bytesRead: Int
-                    while (trojanSocket.isConnected && !trojanSocket.isClosed) {
-                        bytesRead = trojanIn.read(buffer)
-                        if (bytesRead < 0) break
-                        clientOut.write(buffer, 0, bytesRead)
-                        clientOut.flush()
-                    }
-                } catch (e: Exception) {}
-                try { clientSocket.close() } catch (e: Exception) {}
-            }
-            trojanToClient.start()
-            
-            clientToTrojan.join()
-            trojanToClient.join()
+            bridgeForward(clientSocket, clientIn, clientOut, trojanSocket, trojanIn, trojanOut)
         } catch (e: Exception) {
             Log.e("AnishtayinProxy", "Trojan forwarding failed to $targetHost:$targetPort", e)
             try { trojanSocket?.close() } catch (ex: Exception) {}
@@ -472,14 +583,26 @@ class AnishtayinRayVpnService : VpnService() {
     ) {
         var vlessSocket: Socket? = null
         try {
-            val serverAddr = InetAddress.getByName(profile.address).hostAddress ?: profile.address
+            val serverAddr = cachedServerAddr ?: try {
+                val resolved = InetAddress.getByName(profile.address).hostAddress
+                if (resolved != null) {
+                    cachedServerAddr = resolved
+                    resolved
+                } else {
+                    profile.address
+                }
+            } catch (e: Exception) {
+                profile.address
+            }
             val rawSocket = Socket()
+            tuneSocket(rawSocket)
             protect(rawSocket)
             rawSocket.connect(InetSocketAddress(serverAddr, profile.port), 6000)
             
             if (profile.security.lowercase() == "tls" || profile.security.lowercase() == "reality") {
                 val factory = getTrustAllSocketFactory()
                 val sslSocket = factory.createSocket(rawSocket, profile.address, profile.port, true) as SSLSocket
+                tuneSocket(sslSocket)
                 if (!profile.sni.isNullOrBlank()) {
                     try {
                         val sslParams = sslSocket.sslParameters
@@ -489,11 +612,13 @@ class AnishtayinRayVpnService : VpnService() {
                         Log.e("AnishtayinProxy", "Unable to apply SNI param", ex)
                     }
                 }
+                configureAlpn(sslSocket)
                 sslSocket.startHandshake()
                 vlessSocket = sslSocket
             } else {
                 vlessSocket = rawSocket
             }
+            tuneSocket(vlessSocket)
             
             val vlessOut = vlessSocket.getOutputStream()
             val vlessIn = vlessSocket.getInputStream()
@@ -519,47 +644,24 @@ class AnishtayinRayVpnService : VpnService() {
             vlessOut.write(header.toByteArray())
             vlessOut.flush()
             
-            val clientToVless = Thread {
-                val buffer = ByteArray(16384)
-                try {
-                    var bytesRead: Int
-                    while (clientSocket.isConnected && !clientSocket.isClosed) {
-                        bytesRead = clientIn.read(buffer)
-                        if (bytesRead < 0) break
-                        vlessOut.write(buffer, 0, bytesRead)
-                        vlessOut.flush()
+            // Parse VLESS v0 response header: [1 byte version] + [1 byte addon len] + [addon bytes if any]
+            val version = vlessIn.read()
+            val addonLen = vlessIn.read()
+            if (version >= 0 && addonLen >= 0) {
+                if (addonLen > 0) {
+                    var skipped = 0
+                    val dump = ByteArray(addonLen)
+                    while (skipped < addonLen) {
+                        val r = vlessIn.read(dump, skipped, addonLen - skipped)
+                        if (r < 0) break
+                        skipped += r
                     }
-                } catch (e: Exception) {}
-                try { vlessSocket.close() } catch (e: Exception) {}
+                }
+                
+                bridgeForward(clientSocket, clientIn, clientOut, vlessSocket, vlessIn, vlessOut)
+            } else {
+                throw java.io.IOException("VLESS handshake failed: invalid server response headers")
             }
-            clientToVless.start()
-            
-            val vlessToClient = Thread {
-                val buffer = ByteArray(16384)
-                try {
-                    // Parse VLESS v0 response header: [1 byte version] + [1 byte addon len] + [addon bytes if any]
-                    val version = vlessIn.read()
-                    val addonLen = vlessIn.read()
-                    if (version >= 0 && addonLen >= 0) {
-                        if (addonLen > 0) {
-                            vlessIn.skip(addonLen.toLong())
-                        }
-                        
-                        var bytesRead: Int
-                        while (vlessSocket.isConnected && !vlessSocket.isClosed) {
-                            bytesRead = vlessIn.read(buffer)
-                            if (bytesRead < 0) break
-                            clientOut.write(buffer, 0, bytesRead)
-                            clientOut.flush()
-                        }
-                    }
-                } catch (e: Exception) {}
-                try { clientSocket.close() } catch (e: Exception) {}
-            }
-            vlessToClient.start()
-            
-            clientToVless.join()
-            vlessToClient.join()
         } catch (e: Exception) {
             Log.e("AnishtayinProxy", "VLESS forwarding failed to $targetHost:$targetPort", e)
             try { vlessSocket?.close() } catch (ex: Exception) {}
@@ -577,44 +679,15 @@ class AnishtayinRayVpnService : VpnService() {
         var destSocket: Socket? = null
         try {
             destSocket = Socket()
+            tuneSocket(destSocket)
             protect(destSocket)
             destSocket.connect(InetSocketAddress(targetHost, targetPort), 5000)
+            tuneSocket(destSocket)
             
             val destOut = destSocket.getOutputStream()
             val destIn = destSocket.getInputStream()
             
-            val t1 = Thread {
-                val buffer = ByteArray(16384)
-                try {
-                    var bytesRead: Int
-                    while (clientSocket.isConnected && !clientSocket.isClosed) {
-                        bytesRead = clientIn.read(buffer)
-                        if (bytesRead < 0) break
-                        destOut.write(buffer, 0, bytesRead)
-                        destOut.flush()
-                    }
-                } catch (e: Exception) {}
-                try { destSocket.close() } catch (e: Exception) {}
-            }
-            t1.start()
-            
-            val t2 = Thread {
-                val buffer = ByteArray(16384)
-                try {
-                    var bytesRead: Int
-                    while (destSocket.isConnected && !destSocket.isClosed) {
-                        bytesRead = destIn.read(buffer)
-                        if (bytesRead < 0) break
-                        clientOut.write(buffer, 0, bytesRead)
-                        clientOut.flush()
-                    }
-                } catch (e: Exception) {}
-                try { clientSocket.close() } catch (e: Exception) {}
-            }
-            t2.start()
-            
-            t1.join()
-            t2.join()
+            bridgeForward(clientSocket, clientIn, clientOut, destSocket, destIn, destOut)
         } catch (e: Exception) {
             try { destSocket?.close() } catch (ex: Exception) {}
             try { clientSocket.close() } catch (ex: Exception) {}
@@ -622,9 +695,13 @@ class AnishtayinRayVpnService : VpnService() {
     }
 
     private fun getActiveProfile(): com.example.data.VpnProfile? {
+        val cached = cachedActiveProfile
+        if (cached != null) return cached
         return try {
             val dao = com.example.data.AppDatabase.getDatabase(applicationContext).vpnProfileDao()
-            runBlocking { dao.getSelectedProfile().first() }
+            val profile = runBlocking { dao.getSelectedProfile().first() }
+            cachedActiveProfile = profile
+            profile
         } catch (e: Exception) {
             null
         }
@@ -643,6 +720,21 @@ class AnishtayinRayVpnService : VpnService() {
     private fun disconnect() {
         isRunning = false
         isServiceRunning.value = false
+        
+        // Clear server and profile cache references to allow dynamic transition on restart
+        cachedActiveProfile = null
+        cachedServerAddr = null
+
+        // Drain pending tasks from proxy thread pool
+        try {
+            proxyExecutor.queue.clear()
+        } catch (e: Exception) {}
+        
+        // Clear secure DNS caching layers to prevent stale redirection
+        try {
+            dnsCache.clear()
+            dnsCacheExpiry.clear()
+        } catch (e: Exception) {}
         
         // 1. Rigorous cleanup of active network sockets
         synchronized(activeSockets) {
@@ -850,6 +942,47 @@ class AnishtayinRayVpnService : VpnService() {
         }.apply { start() }
     }
 
+    private fun isAaaaOrHttpsQuery(query: ByteArray): Boolean {
+        try {
+            if (query.size < 12) return false
+            var pos = 12
+            while (pos < query.size) {
+                val len = query[pos].toInt() and 0xFF
+                if (len == 0) {
+                    pos++
+                    break
+                }
+                pos += len + 1
+            }
+            if (pos + 2 <= query.size) {
+                val qtype = ((query[pos].toInt() and 0xFF) shl 8) or (query[pos+1].toInt() and 0xFF)
+                return qtype == 28 || qtype == 65 // 28 is AAAA, 65 is HTTPS
+            }
+        } catch (e: Exception) {
+            Log.e("AnishtayinVpn", "Error parsing DNS packet type", e)
+        }
+        return false
+    }
+
+    private fun buildEmptyDnsResponse(query: ByteArray): ByteArray {
+        val resp = query.clone()
+        if (resp.size >= 12) {
+            // Flags: 0x8180 (Standard query response, No error, Recursion desired + available)
+            resp[2] = 0x81.toByte()
+            resp[3] = 0x80.toByte()
+            // Answer count: 0
+            resp[6] = 0x00.toByte()
+            resp[7] = 0x00.toByte()
+            // Authority count: 0
+            resp[8] = 0x00.toByte()
+            resp[9] = 0x00.toByte()
+            // Additional count: 0
+            resp[10] = 0x00.toByte()
+            resp[11] = 0x00.toByte()
+        }
+        return resp
+    }
+
     private fun handleTunPacket(packet: ByteArray, length: Int, outputStream: java.io.FileOutputStream) {
         if (length < 28) return
         
@@ -870,48 +1003,95 @@ class AnishtayinRayVpnService : VpnService() {
             val dnsQuery = ByteArray(dnsPayloadLen)
             System.arraycopy(packet, 28, dnsQuery, 0, dnsPayloadLen)
             
-            Thread {
+            if (isAaaaOrHttpsQuery(dnsQuery)) {
+                val dnsResponse = buildEmptyDnsResponse(dnsQuery)
+                sendDnsResponse(packet, dnsResponse, outputStream)
+                return
+            }
+            
+            proxyExecutor.submit {
                 val dnsResponse = queryDoh(dnsQuery)
                 if (dnsResponse != null) {
                     sendDnsResponse(packet, dnsResponse, outputStream)
                 }
-            }.start()
+            }
         }
     }
 
-    private fun queryDoh(dnsQuery: ByteArray): ByteArray? {
-        try {
-            val builder = okhttp3.OkHttpClient.Builder()
-                .connectTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
-                .readTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
-            
-            // Route via our local HTTP proxy to bypass active DPI censorship
-            try {
-                val proxy = java.net.Proxy(java.net.Proxy.Type.HTTP, java.net.InetSocketAddress("127.0.0.1", 10809))
-                builder.proxy(proxy)
-            } catch (e: Exception) {}
-            
-            val client = builder.build()
-            val requestBody = okhttp3.RequestBody.create(
-                "application/dns-message".toMediaTypeOrNull(),
-                dnsQuery
-            )
-            
-            val request = okhttp3.Request.Builder()
-                .url("https://1.1.1.1/dns-query") // Bypass bootstrap DNS
-                .header("Accept", "application/dns-message")
-                .header("Host", "cloudflare-dns.com")
-                .post(requestBody)
-                .build()
-            
-            client.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    return response.body?.bytes()
-                }
+    private fun executeDohCall(client: okhttp3.OkHttpClient?, url: String, host: String, dnsQuery: ByteArray): ByteArray? {
+        val targetClient = client ?: return null
+        val requestBody = okhttp3.RequestBody.create(
+            "application/dns-message".toMediaTypeOrNull(),
+            dnsQuery
+        )
+        val request = okhttp3.Request.Builder()
+            .url(url)
+            .header("Accept", "application/dns-message")
+            .header("Host", host)
+            .post(requestBody)
+            .build()
+        targetClient.newCall(request).execute().use { response ->
+            if (response.isSuccessful) {
+                return response.body?.bytes()
             }
-        } catch (e: Exception) {
-            Log.e("AnishtayinVpn", "Secure DoH failed", e)
         }
+        return null
+    }
+
+    private fun queryDoh(dnsQuery: ByteArray): ByteArray? {
+        if (dnsQuery.size <= 2) return null
+        
+        // 1. Check Cache (Skip first 2 bytes to match questions regardless of transaction ID)
+        val cacheKey = byteArrayToHex(dnsQuery, 2, dnsQuery.size - 2)
+        val now = System.currentTimeMillis()
+        val cached = dnsCache[cacheKey]
+        val expiry = dnsCacheExpiry[cacheKey] ?: 0L
+        
+        if (cached != null && now < expiry) {
+            val response = cached.clone()
+            if (response.size >= 2) {
+                // Impose current request transaction ID
+                response[0] = dnsQuery[0]
+                response[1] = dnsQuery[1]
+                return response
+            }
+        }
+
+        val endpoints = listOf(
+            Pair("https://1.1.1.1/dns-query", "cloudflare-dns.com"),
+            Pair("https://8.8.8.8/dns-query", "dns.google"),
+            Pair("https://9.9.9.9/dns-query", "dns.quad9.net"),
+            Pair("https://94.140.14.140/dns-query", "dns.adguard-dns.com")
+        )
+
+        // 2. Try proxied DoH (bypasses DPI, encrypted inside the active proxy tunnel)
+        for (endpoint in endpoints) {
+            try {
+                val responseBytes = executeDohCall(dohClient, endpoint.first, endpoint.second, dnsQuery)
+                if (responseBytes != null && responseBytes.isNotEmpty()) {
+                    dnsCache[cacheKey] = responseBytes
+                    dnsCacheExpiry[cacheKey] = now + 300000L // 5 mins TTL
+                    return responseBytes
+                }
+            } catch (e: Exception) {
+                // Failover to next endpoint
+            }
+        }
+
+        // 3. Fallback to direct secure DNS if the proxy server is offline, switching, or bootstrapping
+        for (endpoint in endpoints) {
+            try {
+                val responseBytes = executeDohCall(directDohClient, endpoint.first, endpoint.second, dnsQuery)
+                if (responseBytes != null && responseBytes.isNotEmpty()) {
+                    dnsCache[cacheKey] = responseBytes
+                    dnsCacheExpiry[cacheKey] = now + 120000L // 2 mins TTL
+                    return responseBytes
+                }
+            } catch (e: Exception) {
+                // Failover to next direct endpoint
+            }
+        }
+
         return null
     }
 

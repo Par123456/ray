@@ -408,6 +408,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
                     if (profile.port == 443 || profile.security == "tls" || profile.security == "reality") {
                         val factory = javax.net.ssl.SSLSocketFactory.getDefault()
                         factory.createSocket().use { socket ->
+                            try { socket.tcpNoDelay = true } catch (e: Exception) {}
                             socket.connect(java.net.InetSocketAddress(address, profile.port), 1800)
                             if (socket is javax.net.ssl.SSLSocket) {
                                 if (!profile.sni.isNullOrBlank()) {
@@ -424,6 +425,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     } else {
                         java.net.Socket().use { socket ->
+                            try { socket.tcpNoDelay = true } catch (e: Exception) {}
                             socket.connect(java.net.InetSocketAddress(address, profile.port), 1800)
                         }
                     }
@@ -458,6 +460,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
                             if (profile.port == 443 || profile.security == "tls" || profile.security == "reality") {
                                 val factory = javax.net.ssl.SSLSocketFactory.getDefault()
                                 factory.createSocket().use { socket ->
+                                    try { socket.tcpNoDelay = true } catch (e: Exception) {}
                                     socket.connect(java.net.InetSocketAddress(address, profile.port), 1800)
                                     if (socket is javax.net.ssl.SSLSocket) {
                                         if (!profile.sni.isNullOrBlank()) {
@@ -474,6 +477,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
                                 }
                             } else {
                                 java.net.Socket().use { socket ->
+                                    try { socket.tcpNoDelay = true } catch (e: Exception) {}
                                     socket.connect(java.net.InetSocketAddress(address, profile.port), 1800)
                                 }
                             }
