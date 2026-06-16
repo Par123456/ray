@@ -1,0 +1,6 @@
+{
+  "name": "AnishtayiN-RAY",
+  "description": "Premium V2Ray client featuring Shadowsocks, VLESS, configuration clipboard imports, latency checking, and QR scanning.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
